@@ -29,5 +29,5 @@ As a result you'll get `output.dll` which you can inject
 - Only Forge mods are supported, by now
 - Only mods that do not require usage of URLClassLoader to do something dynamically
 - Your mod should do all stuff inside no-args constructor in class that is marked with `@Mod` annotation
-- Tested on 1.7.10, 1.8.8, 1.12.2, 1.16.5
+- Tested on 1.7.10, 1.8.8, 1.12.2, 1.16.5, 1.21.4
 
