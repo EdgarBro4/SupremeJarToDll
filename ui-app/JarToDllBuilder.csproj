@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net11.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>Supreme Jar To Dll</AssemblyName>
+    <RootNamespace>JarToDllBuilder</RootNamespace>
+    <Version>2.0.0</Version>
+    <Product>Supreme Jar To Dll</Product>
+    <Description>Standalone Windows GUI builder that converts Minecraft Forge 1.16.5 and 1.21.4 JAR mods into injectable Windows DLLs.</Description>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <UseAppHost>true</UseAppHost>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="..\native-src\main.cpp" LogicalName="Assets/native-src/main.cpp" />
+    <EmbeddedResource Include="..\native-src\injector.cpp" LogicalName="Assets/native-src/injector.cpp" />
+    <EmbeddedResource Include="..\native-src\injector.h" LogicalName="Assets/native-src/injector.h" />
+    <EmbeddedResource Include="..\native-src\utils.cpp" LogicalName="Assets/native-src/utils.cpp" />
+    <EmbeddedResource Include="..\native-src\utils.h" LogicalName="Assets/native-src/utils.h" />
+    <EmbeddedResource Include="..\native-src\jvm\jni.h" LogicalName="Assets/native-src/jvm/jni.h" />
+    <EmbeddedResource Include="..\native-src\jvm\jni_md.h" LogicalName="Assets/native-src/jvm/jni_md.h" />
+    <EmbeddedResource Include="..\native-src\jvm\jvmti.h" LogicalName="Assets/native-src/jvm/jvmti.h" />
+    <EmbeddedResource Include="..\header-converter-src\HeaderConverter.java" LogicalName="Assets/header-converter-src/HeaderConverter.java" />
+    <EmbeddedResource Include="..\injector-src\ForgeInjector.java" LogicalName="Assets/injector-src/1.21.4/ForgeInjector.java" />
+    <EmbeddedResource Include="..\injector-src\1.16.5\ForgeInjector.java" LogicalName="Assets/injector-src/1.16.5/ForgeInjector.java" />
+  </ItemGroup>
+
+</Project>

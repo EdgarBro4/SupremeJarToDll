@@ -1,28 +1,37 @@
 import java.io.ByteArrayOutputStream;
-import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.jar.JarFile;
 import java.util.stream.Collectors;
 import java.util.zip.ZipEntry;
-import java.util.HashMap;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
-import java.util.List;
-import java.util.ArrayList;
-import java.util.Collections;
 
 public class HeaderConverter {
+
+    private static final String[] PROHIBITED_PREFIXES = new String[] {
+            "java/", "javax/", "sun/", "com/sun/", "jdk/"
+    };
+
+    private static final String[] FORGE_1165_CORE_PREFIXES = new String[] {
+            "net/minecraft/", "net/minecraftforge/", "cpw/mods/"
+    };
 
     private static class ClassFile implements Comparable<ClassFile> {
         private String name;
         private String superClass;
         private String[] interfaces;
+        private int majorVersion;
+        private int multiReleaseVersion = 8;
         private byte[] classData;
         private String[] cpStrings;
         private short[] cpClasses;
@@ -46,8 +55,9 @@ public class HeaderConverter {
         private static final byte CONSTANT_Module = 19;
         private static final byte CONSTANT_Package = 20;
 
-        public ClassFile(byte[] classData) {
+        public ClassFile(byte[] classData, int multiReleaseVersion) {
             this.classData = classData;
+            this.multiReleaseVersion = multiReleaseVersion;
             this.parse(ByteBuffer.wrap(classData));
         }
 
@@ -55,8 +65,8 @@ public class HeaderConverter {
             if (buf.order(ByteOrder.BIG_ENDIAN).getInt() != HEAD) {
                 throw new RuntimeException("Not a class file");
             }
-            buf.getChar();
-            buf.getChar();
+            buf.getChar(); // minor
+            this.majorVersion = buf.getChar();
             int cpSize = buf.getChar();
             this.cpStrings = new String[cpSize];
             this.cpClasses = new short[cpSize];
@@ -127,15 +137,15 @@ public class HeaderConverter {
 
             while (buf.hasRemaining()) {
                 byte b = buf.get();
-                if (b > 0) {
-                    sb.append((char)b);
+                if ((b & 0x80) == 0) {
+                    sb.append((char) b);
                 } else {
                     int b2 = buf.get();
                     if ((b & 240) != 224) {
-                        sb.append((char)((b & 31) << 6 | b2 & 63));
+                        sb.append((char) ((b & 31) << 6 | b2 & 63));
                     } else {
                         int b3 = buf.get();
-                        sb.append((char)((b & 15) << 12 | (b2 & 63) << 6 | b3 & 63));
+                        sb.append((char) ((b & 15) << 12 | (b2 & 63) << 6 | b3 & 63));
                     }
                 }
             }
@@ -156,6 +166,14 @@ public class HeaderConverter {
             return this.interfaces;
         }
 
+        public int getMajorVersion() {
+            return this.majorVersion;
+        }
+
+        public int getMultiReleaseVersion() {
+            return this.multiReleaseVersion;
+        }
+
         public int getPriority() {
             return priority;
         }
@@ -171,11 +189,11 @@ public class HeaderConverter {
         @Override
         public int compareTo(ClassFile o) {
             return o.priority - this.priority;
-        }      
+        }
     }
 
     private static String convertByteArrayToCppString(byte[] data) {
-        StringBuilder result = new StringBuilder();
+        StringBuilder result = new StringBuilder(data.length * 5 + 8);
         result.append("{ ");
         for (byte b : data) {
             result.append(b).append(", ");
@@ -185,21 +203,22 @@ public class HeaderConverter {
 
     private static byte[] readStreamFully(InputStream stream) throws IOException {
         ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-        byte[] buffer = new byte[4096];
+        byte[] buffer = new byte[8192];
         while (true) {
             int read = stream.read(buffer);
-
             if (read == -1) {
                 break;
             }
-
             outputStream.write(buffer, 0, read);
         }
         return outputStream.toByteArray();
     }
 
     private static void processInjectorClass(String inputPath, String outputPath) throws IOException {
-        byte[] classData = readStreamFully(Files.newInputStream(Paths.get(inputPath)));
+        byte[] classData;
+        try (InputStream stream = Files.newInputStream(Paths.get(inputPath))) {
+            classData = readStreamFully(stream);
+        }
         String cppDataString = convertByteArrayToCppString(classData);
 
         StringBuilder resultFile = new StringBuilder();
@@ -212,21 +231,97 @@ public class HeaderConverter {
         }
     }
 
-    private static void processInputJar(String inputPath, String outputPath) throws IOException {
-        Map<String, ClassFile> classes = new HashMap<>();
-        try (JarFile jarFile = new JarFile(inputPath)) {
+    private static int parseMultiReleaseVersion(String entryName) {
+        String prefix = "META-INF/versions/";
+        if (!entryName.startsWith(prefix)) {
+            return 8;
+        }
+        int slash = entryName.indexOf('/', prefix.length());
+        if (slash <= prefix.length()) {
+            return -1;
+        }
+        try {
+            return Integer.parseInt(entryName.substring(prefix.length(), slash));
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    private static boolean hasPrefix(String name, String[] prefixes) {
+        for (String p : prefixes) {
+            if (name.startsWith(p)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void loadJarClasses(String jarPath, String targetVersion, Map<String, ClassFile> classes, boolean isLibrary) throws IOException {
+        boolean is1165 = "1.16.5".equals(targetVersion);
+        int maxJavaVersion = is1165 ? 8 : 21;
+        int skippedMr = 0;
+        int skippedCore = 0;
+        int highBytecodeWarnings = 0;
+
+        try (JarFile jarFile = new JarFile(jarPath)) {
             for (ZipEntry entry : jarFile.stream().collect(Collectors.toList())) {
-                if (!entry.getName().endsWith(".class") || entry.getName().endsWith("module-info.class")) {
+                String entryName = entry.getName();
+                if (!entryName.endsWith(".class") || entryName.endsWith("module-info.class") || entryName.endsWith("package-info.class")) {
+                    continue;
+                }
+                int mrVersion = parseMultiReleaseVersion(entryName);
+                if (mrVersion < 0 || mrVersion > maxJavaVersion) {
+                    skippedMr++;
                     continue;
                 }
                 try (InputStream stream = jarFile.getInputStream(entry)) {
-                    ClassFile classFile = new ClassFile(readStreamFully(stream));
-                    classes.put(classFile.getName(), classFile);
+                    ClassFile classFile = new ClassFile(readStreamFully(stream), mrVersion);
+                    String clsName = classFile.getName();
+                    if (clsName == null || hasPrefix(clsName, PROHIBITED_PREFIXES)) {
+                        skippedCore++;
+                        continue;
+                    }
+                    if (is1165 && hasPrefix(clsName, FORGE_1165_CORE_PREFIXES)) {
+                        skippedCore++;
+                        continue;
+                    }
+                    if (is1165 && classFile.getMajorVersion() > 52) {
+                        highBytecodeWarnings++;
+                    }
+                    ClassFile existing = classes.get(clsName);
+                    if (existing == null || (!isLibrary && classFile.getMultiReleaseVersion() >= existing.getMultiReleaseVersion())) {
+                        classes.put(clsName, classFile);
+                    }
                 }
             }
         }
 
-        System.out.println("Processing " + classes.size() + " classes");
+        if (skippedMr > 0) {
+            System.out.println("Filtered " + skippedMr + " incompatible multi-release class(es) for Java " + maxJavaVersion + " (" + targetVersion + ")");
+        }
+        if (skippedCore > 0) {
+            System.out.println("Skipped " + skippedCore + " protected JDK/Minecraft/Forge core class(es)");
+        }
+        if (highBytecodeWarnings > 0) {
+            System.out.println("WARNING: " + highBytecodeWarnings + " class(es) exceed Java 8 bytecode (major > 52). Ensure this JAR is built for Minecraft 1.16.5.");
+        }
+    }
+
+    private static void processInputJar(String inputPath, String outputPath, String targetVersion, List<String> extraLibs) throws IOException {
+        Map<String, ClassFile> classes = new HashMap<>();
+
+        for (String libPath : extraLibs) {
+            System.out.println("Merging library JAR: " + libPath);
+            loadJarClasses(libPath, targetVersion, classes, true);
+        }
+
+        loadJarClasses(inputPath, targetVersion, classes, false);
+
+        if (classes.isEmpty()) {
+            throw new RuntimeException("No valid .class files found in input JAR: " + inputPath);
+        }
+
+        System.out.println("Processing " + classes.size() + " classes (target: Forge " + targetVersion + ")");
 
         boolean changed = true;
         int iterations = 0;
@@ -271,14 +366,13 @@ public class HeaderConverter {
         System.out.println("Load priority calculated, sorting...");
 
         List<ClassFile> resultClasses = new ArrayList<>(classes.values());
-
         Collections.sort(resultClasses);
 
-        List<String> classDataStrings = new ArrayList<>();
+        List<String> classDataStrings = new ArrayList<>(resultClasses.size());
         for (ClassFile file : resultClasses) {
             classDataStrings.add(convertByteArrayToCppString(file.getClassData()));
         }
-        
+
         StringBuilder resultFile = new StringBuilder();
         resultFile.append("#ifndef CLASSES_JAR_H_\n#define CLASSES_JAR_H_\n\n#include \"../jvm/jni.h\"\n\n");
         for (int i = 0; i < classDataStrings.size(); i++) {
@@ -300,21 +394,33 @@ public class HeaderConverter {
     }
 
     public static void main(String[] args) throws Throwable {
-        if (args.length != 3) {
-            throw new RuntimeException("Wrong number of arguments, usage: <injector/input-jar> <input jar or class file> <output path>");
+        if (args.length < 3) {
+            throw new RuntimeException("Wrong number of arguments, usage: <injector/input-jar> <input jar or class file> <output path> [--target=1.16.5|1.21.4] [--lib=<extra.jar>]");
         }
 
         String type = args[0];
         String input = args[1];
         String output = args[2];
+        String targetVersion = "1.21.4";
+        List<String> extraLibs = new ArrayList<>();
+
+        for (int i = 3; i < args.length; i++) {
+            if (args[i].startsWith("--target=")) {
+                targetVersion = args[i].substring("--target=".length());
+            } else if (args[i].startsWith("--lib=")) {
+                extraLibs.add(args[i].substring("--lib=".length()));
+            }
+        }
 
         switch (type) {
             case "injector":
                 processInjectorClass(input, output);
                 break;
             case "input-jar":
-                processInputJar(input, output);
+                processInputJar(input, output, targetVersion, extraLibs);
                 break;
+            default:
+                throw new RuntimeException("Unknown conversion type: " + type);
         }
 
         System.out.println("Ready for " + type);

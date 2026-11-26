@@ -20,16 +20,27 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executor;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 public class ForgeInjector extends Thread implements Supplier<Object>, InvocationHandler {
+    private static final String[] SHARED_LIBRARY_PREFIXES = new String[] {
+            "java.", "javax.", "sun.", "com.sun.", "jdk.",
+            "net.minecraft.", "net.minecraftforge.", "cpw.mods.",
+            "org.spongepowered.", "org.lwjgl.", "io.netty.",
+            "com.mojang.", "org.apache.logging.", "org.slf4j."
+    };
+
     private final byte[][] classes;
     private volatile Object activeJavaModLoadingContext;
+    private volatile Object activeModContainer;
+    private volatile Object activeDeferredWorkQueue;
     private volatile Object realModEventBus;
     private volatile Object proxyModEventBus;
-    private final List<Object> capturedModBusListeners = new ArrayList<Object>();
+    private volatile boolean hasModBusSubscribers = false;
+    private final List<Object[]> capturedModBusListeners = new ArrayList<Object[]>();
     private volatile int executionPhase = 0;
     private volatile ClassLoader targetClassLoader;
     private volatile PrintWriter activeWriter;
@@ -125,17 +136,39 @@ public class ForgeInjector extends Thread implements Supplier<Object>, Invocatio
         if ("toString".equals(name)) {
             return "CleanJarToDLL_Proxy";
         }
-        if (args != null && args.length == 2 && method.getReturnType() == void.class && !"addListener".equals(name)) {
+        if ("get".equals(name) && (args == null || args.length == 0)) {
+            return this.activeDeferredWorkQueue;
+        }
+        if (args != null && args.length == 2 && method.getReturnType() == void.class
+                && !"addListener".equals(name) && !"addGenericListener".equals(name)) {
             runModuleTicks();
             return null;
         }
-        if ("addListener".equals(name) && args != null) {
+        if (("addListener".equals(name) || "addGenericListener".equals(name)) && args != null) {
+            Class<?> explicitEventType = null;
+            Object consumer = null;
             for (Object arg : args) {
-                if (arg instanceof Consumer) {
-                    synchronized (this.capturedModBusListeners) {
-                        this.capturedModBusListeners.add(arg);
+                if (arg instanceof Class<?>) {
+                    explicitEventType = (Class<?>) arg;
+                } else if (arg instanceof Consumer) {
+                    consumer = arg;
+                }
+            }
+            if (consumer != null) {
+                synchronized (this.capturedModBusListeners) {
+                    boolean duplicate = false;
+                    for (Object[] existing : this.capturedModBusListeners) {
+                        if (existing[0] == explicitEventType
+                                && (existing[1] == consumer || (existing[1] != null && existing[1].equals(consumer)))) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (!duplicate) {
+                        this.capturedModBusListeners.add(new Object[] { explicitEventType, consumer });
                     }
                 }
+                return null;
             }
         }
         if (this.realModEventBus != null) {
@@ -150,6 +183,9 @@ public class ForgeInjector extends Thread implements Supplier<Object>, Invocatio
         Class<?> retType = method.getReturnType();
         if (retType == boolean.class) {
             return Boolean.FALSE;
+        }
+        if (retType == int.class) {
+            return Integer.valueOf(0);
         }
         return null;
     }
@@ -268,7 +304,8 @@ public class ForgeInjector extends Thread implements Supplier<Object>, Invocatio
                         "net.jodah.typetools.TypeResolver",
                         "net.minecraft.client.Minecraft",
                         "cpw.mods.cl.ModuleClassLoader",
-                        "cpw.mods.modlauncher.TransformingClassLoader"
+                        "cpw.mods.modlauncher.TransformingClassLoader",
+                        "net.minecraftforge.securemodules.SecureModuleClassLoader"
                 };
                 for (String probe : probeClasses) {
                     try {
@@ -527,15 +564,43 @@ public class ForgeInjector extends Thread implements Supplier<Object>, Invocatio
         return classData;
     }
 
+    private static boolean isSharedLibraryClass(String binaryName) {
+        for (String prefix : SHARED_LIBRARY_PREFIXES) {
+            if (binaryName.startsWith(prefix)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static Class<?> defineSingleClass(
             PrintWriter writer,
             ClassLoader cl,
+            Method findLoadedClassMethod,
             Method defineClassMethod,
             Object classTransformer,
             Method transformMethod,
             String binaryName,
             byte[] classData,
             ProtectionDomain pd) throws Exception {
+        if (findLoadedClassMethod != null) {
+            try {
+                Class<?> alreadyLoaded = (Class<?>) findLoadedClassMethod.invoke(cl, binaryName);
+                if (alreadyLoaded != null) {
+                    return alreadyLoaded;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
+        if (isSharedLibraryClass(binaryName)) {
+            try {
+                return Class.forName(binaryName, false, cl);
+            } catch (ClassNotFoundException ignored) {
+                // Library not present in MC/Forge; fall through and define bundled copy
+            }
+        }
+
         byte[] bytesToDefine = tryTransformBytes(classTransformer, transformMethod, binaryName, classData);
         try {
             return (Class<?>) defineClassMethod.invoke(cl, binaryName, bytesToDefine, 0, bytesToDefine.length, pd);
@@ -569,6 +634,7 @@ public class ForgeInjector extends Thread implements Supplier<Object>, Invocatio
     private static Class<?> defineClassRecursive(
             PrintWriter writer,
             ClassLoader cl,
+            Method findLoadedClassMethod,
             Method defineClassMethod,
             Object classTransformer,
             Method transformMethod,
@@ -595,28 +661,55 @@ public class ForgeInjector extends Thread implements Supplier<Object>, Invocatio
             if (dollarIdx > 0) {
                 String outerName = internalName.substring(0, dollarIdx);
                 if (pendingBytes.containsKey(outerName) && !definedClasses.containsKey(outerName)) {
-                    defineClassRecursive(writer, cl, defineClassMethod, classTransformer, transformMethod, pd,
-                            outerName, pendingBytes, parsedHeaders, definedClasses, visiting);
+                    defineClassRecursive(writer, cl, findLoadedClassMethod, defineClassMethod, classTransformer,
+                            transformMethod, pd, outerName, pendingBytes, parsedHeaders, definedClasses, visiting);
                 }
             }
             String superName = header[0][1];
             if (superName != null && pendingBytes.containsKey(superName) && !definedClasses.containsKey(superName)) {
-                defineClassRecursive(writer, cl, defineClassMethod, classTransformer, transformMethod, pd, superName,
-                        pendingBytes, parsedHeaders, definedClasses, visiting);
+                defineClassRecursive(writer, cl, findLoadedClassMethod, defineClassMethod, classTransformer,
+                        transformMethod, pd, superName, pendingBytes, parsedHeaders, definedClasses, visiting);
             }
             for (String iface : header[1]) {
                 if (iface != null && pendingBytes.containsKey(iface) && !definedClasses.containsKey(iface)) {
-                    defineClassRecursive(writer, cl, defineClassMethod, classTransformer, transformMethod, pd, iface,
-                            pendingBytes, parsedHeaders, definedClasses, visiting);
+                    defineClassRecursive(writer, cl, findLoadedClassMethod, defineClassMethod, classTransformer,
+                            transformMethod, pd, iface, pendingBytes, parsedHeaders, definedClasses, visiting);
                 }
             }
         }
 
         String binaryName = internalName.replace('/', '.');
-        Class<?> defined = defineSingleClass(writer, cl, defineClassMethod, classTransformer, transformMethod,
-                binaryName, data, pd);
+        Class<?> defined = defineSingleClass(writer, cl, findLoadedClassMethod, defineClassMethod, classTransformer,
+                transformMethod, binaryName, data, pd);
         definedClasses.put(internalName, defined);
         return defined;
+    }
+
+    private static void registerPackagesInMapField(ClassLoader loader, Field mapField, ClassLoader gameClassLoader,
+            Set<String> packageNames) throws Exception {
+        if (mapField == null) {
+            return;
+        }
+        Object mapObj = mapField.get(loader);
+        if (!(mapObj instanceof Map)) {
+            return;
+        }
+        Map<String, ClassLoader> map = (Map<String, ClassLoader>) mapObj;
+        try {
+            for (String pkg : packageNames) {
+                if (!map.containsKey(pkg)) {
+                    map.put(pkg, gameClassLoader);
+                }
+            }
+        } catch (UnsupportedOperationException uoe) {
+            Map<String, ClassLoader> mutableCopy = new HashMap<String, ClassLoader>(map);
+            for (String pkg : packageNames) {
+                if (!mutableCopy.containsKey(pkg)) {
+                    mutableCopy.put(pkg, gameClassLoader);
+                }
+            }
+            setFieldValue(loader, mapField, mutableCopy);
+        }
     }
 
     private static void registerPackagesInParentModuleClassLoaders(PrintWriter writer, ClassLoader gameClassLoader,
@@ -645,19 +738,101 @@ public class ForgeInjector extends Thread implements Supplier<Object>, Invocatio
             for (ClassLoader loader : loaders) {
                 if (loader == null || loader == gameClassLoader)
                     continue;
-                Field parentLoadersField = findFieldByName(loader.getClass(), "parentLoaders");
-                if (parentLoadersField != null) {
-                    Object mapObj = parentLoadersField.get(loader);
-                    if (mapObj instanceof Map) {
-                        Map<String, ClassLoader> parentLoaders = (Map<String, ClassLoader>) mapObj;
-                        for (String pkg : packageNames) {
-                            parentLoaders.put(pkg, gameClassLoader);
-                        }
-                    }
-                }
+                registerPackagesInMapField(loader, findFieldByName(loader.getClass(), "parentLoaders"),
+                        gameClassLoader, packageNames);
+                registerPackagesInMapField(loader, findFieldByName(loader.getClass(), "packageToParentLoader"),
+                        gameClassLoader, packageNames);
             }
         } catch (Throwable t) {
             log(writer, "Notice registering packages in ModuleClassLoader: " + t);
+        }
+    }
+
+    private static void ensureBusUsesClassLoaderFactory(PrintWriter writer, ClassLoader cl, Object eventBus,
+            String busLabel, List<Class<?>> allDefinedClasses) {
+        if (eventBus == null) {
+            return;
+        }
+        try {
+            Field factoryField = findFieldByName(eventBus.getClass(), "factory");
+            if (factoryField == null) {
+                factoryField = findFieldByName(eventBus.getClass(), "listenerFactory");
+            }
+            if (factoryField == null) {
+                return;
+            }
+            Object currentFactory = factoryField.get(eventBus);
+            if (currentFactory == null) {
+                return;
+            }
+            String factoryClassName = currentFactory.getClass().getName();
+            if (factoryClassName.endsWith(".ClassLoaderFactory")) {
+                log(writer, "Verified " + busLabel + " already uses ClassLoaderFactory");
+                return;
+            }
+
+            // ModLauncherFactory tries to load generated __Class_method_Event wrappers through
+            // SecureModuleClassLoader/TransformingClassLoader, which always fails with
+            // ClassNotFoundException for runtime-defined classes not backed by a JPMS module.
+            if (factoryClassName.endsWith(".ModLauncherFactory")) {
+                Class<?> clfClass = Class.forName("net.minecraftforge.eventbus.ClassLoaderFactory", false, cl);
+                Constructor<?> clfCtor = clfClass.getDeclaredConstructor();
+                forceAccessible(clfCtor);
+                Object newFactory = clfCtor.newInstance();
+                setFieldValue(eventBus, factoryField, newFactory);
+                log(writer, "Switched " + busLabel + " factory from ModLauncherFactory to ClassLoaderFactory");
+                return;
+            }
+
+            if (allDefinedClasses == null || allDefinedClasses.isEmpty()) {
+                return;
+            }
+            Class<?> subAnno = Class.forName("net.minecraftforge.eventbus.api.SubscribeEvent", false, cl);
+            Method sampleMethod = null;
+            Class<?> sampleClass = null;
+            boolean sampleIsStatic = false;
+            for (Class<?> cls : allDefinedClasses) {
+                if (cls == null || cls.isInterface() || Modifier.isAbstract(cls.getModifiers())) {
+                    continue;
+                }
+                for (Method m : cls.getDeclaredMethods()) {
+                    if (m.getAnnotation((Class) subAnno) != null) {
+                        sampleMethod = m;
+                        sampleClass = cls;
+                        sampleIsStatic = Modifier.isStatic(m.getModifiers());
+                        break;
+                    }
+                }
+                if (sampleMethod != null) {
+                    break;
+                }
+            }
+            if (sampleMethod == null || sampleClass == null) {
+                return;
+            }
+
+            try {
+                Object dummyTarget = sampleIsStatic ? null : unsafeAllocateInstance.invoke(theUnsafe, sampleClass);
+                Method createMethod = currentFactory.getClass().getMethod("create", Method.class, Object.class);
+                forceAccessible(createMethod);
+                createMethod.invoke(currentFactory, sampleMethod, dummyTarget);
+                log(writer, "Verified " + busLabel + " listenerFactory (" + currentFactory.getClass().getSimpleName()
+                        + ") works on injected classes");
+            } catch (Throwable t) {
+                Throwable rootCause = t instanceof InvocationTargetException && t.getCause() != null ? t.getCause() : t;
+                log(writer, busLabel + " factory (" + currentFactory.getClass().getSimpleName() + ") threw "
+                        + rootCause + "; switching to ClassLoaderFactory");
+                Class<?> clfClass = Class.forName("net.minecraftforge.eventbus.ClassLoaderFactory", false, cl);
+                Constructor<?> clfCtor = clfClass.getDeclaredConstructor();
+                forceAccessible(clfCtor);
+                Object newFactory = clfCtor.newInstance();
+                setFieldValue(eventBus, factoryField, newFactory);
+                log(writer, "Switched " + busLabel + " factory to ClassLoaderFactory");
+            }
+        } catch (ClassNotFoundException ignored) {
+        } catch (Throwable t) {
+            Throwable rootCause = t instanceof InvocationTargetException && t.getCause() != null ? t.getCause() : t;
+            log(writer, "Notice checking " + busLabel + " factory: " + rootCause);
         }
     }
 
@@ -668,55 +843,11 @@ public class ForgeInjector extends Thread implements Supplier<Object>, Invocatio
             Field eventBusField = minecraftForgeCls.getDeclaredField("EVENT_BUS");
             forceAccessible(eventBusField);
             Object forgeBus = eventBusField.get(null);
-            if (forgeBus == null)
-                return;
-
-            Class<?> subAnno = Class.forName("net.minecraftforge.eventbus.api.SubscribeEvent", false, cl);
-            Method sampleMethod = null;
-            Class<?> sampleClass = null;
-            for (Class<?> cls : allDefinedClasses) {
-                for (Method m : cls.getDeclaredMethods()) {
-                    if (m.getAnnotation((Class) subAnno) != null && !Modifier.isStatic(m.getModifiers())) {
-                        sampleMethod = m;
-                        sampleClass = cls;
-                        break;
-                    }
-                }
-                if (sampleMethod != null)
-                    break;
-            }
-            if (sampleMethod == null || sampleClass == null)
-                return;
-
-            Field factoryField = findFieldByName(forgeBus.getClass(), "factory");
-            if (factoryField == null) {
-                factoryField = findFieldByName(forgeBus.getClass(), "listenerFactory");
-            }
-            if (factoryField != null) {
-                Object currentFactory = factoryField.get(forgeBus);
-                if (currentFactory != null) {
-                    Object dummyTarget = unsafeAllocateInstance.invoke(theUnsafe, sampleClass);
-                    Method createMethod = currentFactory.getClass().getMethod("create", Method.class, Object.class);
-                    forceAccessible(createMethod);
-                    try {
-                        createMethod.invoke(currentFactory, sampleMethod, dummyTarget);
-                        log(writer, "Verified EventBus listenerFactory (" + currentFactory.getClass().getSimpleName()
-                                + ") works on injected classes");
-                    } catch (Throwable t) {
-                        log(writer, "ModLauncherFactory threw " + (t.getCause() != null ? t.getCause() : t)
-                                + "; switching EVENT_BUS to ClassLoaderFactory");
-                        Class<?> clfClass = Class.forName("net.minecraftforge.eventbus.ClassLoaderFactory", false, cl);
-                        Constructor<?> clfCtor = clfClass.getDeclaredConstructor();
-                        forceAccessible(clfCtor);
-                        Object newFactory = clfCtor.newInstance();
-                        setFieldValue(forgeBus, factoryField, newFactory);
-                        log(writer, "Switched MinecraftForge.EVENT_BUS factory to ClassLoaderFactory");
-                    }
-                }
-            }
+            ensureBusUsesClassLoaderFactory(writer, cl, forgeBus, "MinecraftForge.EVENT_BUS", allDefinedClasses);
         } catch (ClassNotFoundException ignored) {
         } catch (Throwable t) {
-            log(writer, "Notice checking EventBus factory: " + t);
+            Throwable rootCause = t instanceof InvocationTargetException && t.getCause() != null ? t.getCause() : t;
+            log(writer, "Notice checking EventBus factory: " + rootCause);
         }
     }
 
@@ -774,7 +905,7 @@ public class ForgeInjector extends Thread implements Supplier<Object>, Invocatio
         field.set(target, value);
     }
 
-    private Object setupModernModLoadingContext(PrintWriter writer, ClassLoader cl) {
+    private Object setupModernModLoadingContext(PrintWriter writer, ClassLoader cl, String modId) {
         try {
             Class<?> modLoadingContextCls = Class.forName("net.minecraftforge.fml.ModLoadingContext", false, cl);
             Class<?> fmlJavaModLoadingContextCls = Class
@@ -788,6 +919,7 @@ public class ForgeInjector extends Thread implements Supplier<Object>, Invocatio
             Object busBuilder = builderMethod.invoke(null);
             Method buildMethod = busBuilderCls.getMethod("build");
             this.realModEventBus = buildMethod.invoke(busBuilder);
+            ensureBusUsesClassLoaderFactory(writer, cl, this.realModEventBus, "realModEventBus", null);
             this.proxyModEventBus = Proxy.newProxyInstance(cl, new Class<?>[] { iEventBusCls }, this);
 
             Object dummyContainer = unsafeAllocateInstance.invoke(theUnsafe, fmlModContainerCls);
@@ -799,6 +931,17 @@ public class ForgeInjector extends Thread implements Supplier<Object>, Invocatio
             if (contextExtField != null) {
                 setFieldValue(dummyContainer, contextExtField, this);
             }
+            if (modId != null && modId.length() > 0) {
+                Field modIdField = findFieldByName(modContainerCls, "modId");
+                if (modIdField != null) {
+                    setFieldValue(dummyContainer, modIdField, modId);
+                }
+                Field namespaceField = findFieldByName(modContainerCls, "namespace");
+                if (namespaceField != null) {
+                    setFieldValue(dummyContainer, namespaceField, modId);
+                }
+            }
+            this.activeModContainer = dummyContainer;
 
             Object javaModCtx = unsafeAllocateInstance.invoke(theUnsafe, fmlJavaModLoadingContextCls);
             Field containerField = findFieldByName(fmlJavaModLoadingContextCls, "container");
@@ -826,7 +969,7 @@ public class ForgeInjector extends Thread implements Supplier<Object>, Invocatio
             Object verifiedCtx = fmlGet.invoke(null);
             Method getModEventBus = fmlJavaModLoadingContextCls.getMethod("getModEventBus");
             Object verifiedBus = getModEventBus.invoke(verifiedCtx);
-            log(writer, "Configured FMLJavaModLoadingContext -> ModEventBus: " + verifiedBus);
+            log(writer, "Configured FMLJavaModLoadingContext (modId=" + modId + ") -> ModEventBus: " + verifiedBus);
             return verifiedBus;
         } catch (ClassNotFoundException ignored) {
             return null;
@@ -835,6 +978,98 @@ public class ForgeInjector extends Thread implements Supplier<Object>, Invocatio
             t.printStackTrace(writer);
             writer.flush();
             return null;
+        }
+    }
+
+    private Object createLifecycleEvent(ClassLoader cl, Class<?> eventCls) throws Exception {
+        Object modContainer = this.activeModContainer;
+        Object evt = unsafeAllocateInstance.invoke(theUnsafe, eventCls);
+        if (modContainer != null) {
+            Field containerField = findFieldByName(eventCls, "container");
+            if (containerField != null) {
+                setFieldValue(evt, containerField, modContainer);
+            }
+        }
+        wireEventWorkQueue(cl, evt);
+        return evt;
+    }
+
+    private void wireEventWorkQueue(ClassLoader cl, Object eventObj) {
+        if (eventObj == null) {
+            return;
+        }
+        try {
+            Class<?> dwqCls = Class.forName("net.minecraftforge.fml.DeferredWorkQueue", false, cl);
+            Object dwqInstance = null;
+            for (Constructor<?> ctor : dwqCls.getDeclaredConstructors()) {
+                if (ctor.getParameterTypes().length == 0) {
+                    forceAccessible(ctor);
+                    dwqInstance = ctor.newInstance();
+                    break;
+                }
+            }
+            if (dwqInstance == null) {
+                dwqInstance = unsafeAllocateInstance.invoke(theUnsafe, dwqCls);
+                Field tasksField = findFieldByType(dwqCls, java.util.Queue.class);
+                if (tasksField != null) {
+                    setFieldValue(dwqInstance, tasksField, new ConcurrentLinkedQueue<Object>());
+                }
+            }
+            this.activeDeferredWorkQueue = dwqInstance;
+            Object dwqSupplierProxy = Proxy.newProxyInstance(cl, new Class<?>[] { Supplier.class }, this);
+            Class<?> curr = eventObj.getClass();
+            while (curr != null && curr != Object.class) {
+                for (Field f : curr.getDeclaredFields()) {
+                    if (Modifier.isStatic(f.getModifiers())) {
+                        continue;
+                    }
+                    forceAccessible(f);
+                    if (f.get(eventObj) != null) {
+                        continue;
+                    }
+                    if (dwqCls.isAssignableFrom(f.getType())) {
+                        setFieldValue(eventObj, f, dwqInstance);
+                    } else if (Supplier.class.isAssignableFrom(f.getType())
+                            && f.getName().toLowerCase().contains("queue")) {
+                        setFieldValue(eventObj, f, dwqSupplierProxy);
+                    }
+                }
+                curr = curr.getSuperclass();
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void drainEventWorkQueue(PrintWriter writer, Object eventObj) {
+        if (eventObj == null) {
+            return;
+        }
+        try {
+            Class<?> curr = eventObj.getClass();
+            while (curr != null && curr != Object.class) {
+                for (Field f : curr.getDeclaredFields()) {
+                    if (Modifier.isStatic(f.getModifiers())) {
+                        continue;
+                    }
+                    forceAccessible(f);
+                    Object val = f.get(eventObj);
+                    if (val instanceof Supplier) {
+                        val = ((Supplier<?>) val).get();
+                    }
+                    if (val != null && val.getClass().getName().endsWith("DeferredWorkQueue")) {
+                        try {
+                            Method runTasks = val.getClass().getDeclaredMethod("runTasks");
+                            forceAccessible(runTasks);
+                            runTasks.invoke(val);
+                            log(writer, "Drained DeferredWorkQueue tasks for " + eventObj.getClass().getSimpleName());
+                        } catch (NoSuchMethodException ignored) {
+                        }
+                    }
+                }
+                curr = curr.getSuperclass();
+            }
+        } catch (Throwable t) {
+            log(writer, "Notice draining DeferredWorkQueue: " + t);
         }
     }
 
@@ -870,37 +1105,70 @@ public class ForgeInjector extends Thread implements Supplier<Object>, Invocatio
         return modClass.newInstance();
     }
 
+    private int dispatchCapturedModBusListeners(PrintWriter writer, Class<?> eventCls, Object eventInstance) {
+        int invoked = 0;
+        List<Object[]> snapshot;
+        synchronized (this.capturedModBusListeners) {
+            snapshot = new ArrayList<Object[]>(this.capturedModBusListeners);
+        }
+        for (Object[] entry : snapshot) {
+            Class<?> listenerEventType = (Class<?>) entry[0];
+            Consumer<Object> listenerConsumer = (Consumer<Object>) entry[1];
+            if (listenerEventType != null && !listenerEventType.isAssignableFrom(eventCls)) {
+                continue;
+            }
+            try {
+                listenerConsumer.accept(eventInstance);
+                invoked++;
+                log(writer, "Dispatched " + eventCls.getSimpleName() + " to captured ModEventBus listener");
+            } catch (ClassCastException ignored) {
+                // Listener lambda expects a different ModBus event type
+            } catch (Throwable t) {
+                log(writer, "Warning in ModEventBus listener for " + eventCls.getSimpleName() + ": " + t);
+                t.printStackTrace(writer);
+                writer.flush();
+            }
+        }
+        return invoked;
+    }
+
     private void fireLifecycleEvent(PrintWriter writer, ClassLoader cl, List<Class<?>> allClasses,
             String eventClassName) {
         try {
             Class<?> eventCls = Class.forName(eventClassName, false, cl);
-            Object eventInstance = unsafeAllocateInstance.invoke(theUnsafe, eventCls);
-            int invokedCount = 0;
+            Object eventInstance = createLifecycleEvent(cl, eventCls);
 
-            for (Class<?> cls : allClasses) {
-                for (Method m : cls.getDeclaredMethods()) {
-                    Class<?>[] params = m.getParameterTypes();
-                    if (params.length == 1 && params[0] == eventCls && Modifier.isStatic(m.getModifiers())) {
-                        forceAccessible(m);
-                        log(writer, "Invoking lifecycle handler " + cls.getName() + "." + m.getName() + "("
-                                + eventCls.getSimpleName() + ")");
-                        m.invoke(null, eventInstance);
-                        invokedCount++;
-                    }
-                }
-            }
+            int invokedCount = dispatchCapturedModBusListeners(writer, eventCls, eventInstance);
 
-            if (invokedCount == 0 && this.realModEventBus != null) {
+            if (this.hasModBusSubscribers && this.realModEventBus != null) {
                 try {
                     Method postMethod = this.realModEventBus.getClass().getMethod("post",
                             Class.forName("net.minecraftforge.eventbus.api.Event", false, cl));
                     forceAccessible(postMethod);
                     postMethod.invoke(this.realModEventBus, eventInstance);
                     log(writer, "Posted " + eventCls.getSimpleName() + " to realModEventBus");
+                    invokedCount++;
                 } catch (Throwable t) {
                     log(writer, "realModEventBus.post(" + eventCls.getSimpleName() + ") notice: " + t);
                 }
             }
+
+            if (invokedCount == 0) {
+                for (Class<?> cls : allClasses) {
+                    for (Method m : cls.getDeclaredMethods()) {
+                        Class<?>[] params = m.getParameterTypes();
+                        if (params.length == 1 && params[0] == eventCls && Modifier.isStatic(m.getModifiers())) {
+                            forceAccessible(m);
+                            log(writer, "Invoking lifecycle handler " + cls.getName() + "." + m.getName() + "("
+                                    + eventCls.getSimpleName() + ")");
+                            m.invoke(null, eventInstance);
+                            invokedCount++;
+                        }
+                    }
+                }
+            }
+
+            drainEventWorkQueue(writer, eventInstance);
         } catch (ClassNotFoundException ignored) {
         } catch (Throwable t) {
             log(writer, "Warning firing " + eventClassName + ": " + t);
@@ -909,7 +1177,7 @@ public class ForgeInjector extends Thread implements Supplier<Object>, Invocatio
         }
     }
 
-    private static void registerEventBusSubscribers(PrintWriter writer, ClassLoader cl, Object modEventBus,
+    private void registerEventBusSubscribers(PrintWriter writer, ClassLoader cl, Object modEventBus,
             List<Class<?>> allClasses) {
         try {
             Class<?> subscriberAnno = Class.forName("net.minecraftforge.fml.common.Mod$EventBusSubscriber", false, cl);
@@ -918,20 +1186,54 @@ public class ForgeInjector extends Thread implements Supplier<Object>, Invocatio
             forceAccessible(forgeBusField);
             Object forgeBus = forgeBusField.get(null);
             Method busMethod = subscriberAnno.getMethod("bus");
+            Method valueMethod = null;
+            try {
+                valueMethod = subscriberAnno.getMethod("value");
+            } catch (NoSuchMethodException ignored) {
+            }
 
             for (Class<?> cls : allClasses) {
                 Object anno = cls.getAnnotation((Class) subscriberAnno);
-                if (anno != null) {
-                    Object busEnum = busMethod.invoke(anno);
-                    String busName = busEnum != null ? busEnum.toString() : "FORGE";
-                    Object targetBus = "MOD".equals(busName) && modEventBus != null ? modEventBus : forgeBus;
-                    if (targetBus != null) {
-                        Method regMethod = targetBus.getClass().getMethod("register", Object.class);
-                        forceAccessible(regMethod);
-                        regMethod.invoke(targetBus, cls);
-                        log(writer,
-                                "Registered @EventBusSubscriber class " + cls.getName() + " on " + busName + " bus");
+                if (anno == null) {
+                    continue;
+                }
+                if (valueMethod != null) {
+                    try {
+                        Object distArrObj = valueMethod.invoke(anno);
+                        if (distArrObj instanceof Object[]) {
+                            Object[] dists = (Object[]) distArrObj;
+                            if (dists.length > 0) {
+                                boolean supportsClient = false;
+                                for (Object d : dists) {
+                                    if (d != null && "CLIENT".equals(d.toString())) {
+                                        supportsClient = true;
+                                        break;
+                                    }
+                                }
+                                if (!supportsClient) {
+                                    log(writer, "Skipping server-only @EventBusSubscriber: " + cls.getName());
+                                    continue;
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {
                     }
+                }
+                Object busEnum = busMethod.invoke(anno);
+                String busName = busEnum != null ? busEnum.toString() : "FORGE";
+                Object targetBus;
+                if ("MOD".equals(busName)) {
+                    targetBus = this.realModEventBus != null ? this.realModEventBus : modEventBus;
+                    this.hasModBusSubscribers = true;
+                } else {
+                    targetBus = forgeBus;
+                }
+                if (targetBus != null) {
+                    Method regMethod = targetBus.getClass().getMethod("register", Object.class);
+                    forceAccessible(regMethod);
+                    regMethod.invoke(targetBus, cls);
+                    log(writer,
+                            "Registered @EventBusSubscriber class " + cls.getName() + " on " + busName + " bus");
                 }
             }
         } catch (ClassNotFoundException ignored) {
@@ -967,6 +1269,9 @@ public class ForgeInjector extends Thread implements Supplier<Object>, Invocatio
                     Field initField = findFieldByName(cls, "initialized");
                     if (initField != null) {
                         setFieldValue(null, initField, Boolean.FALSE);
+                        synchronized (this.capturedModBusListeners) {
+                            this.capturedModBusListeners.clear();
+                        }
                     }
                     Field khField = findFieldByName(cls, "keyHandler");
                     if (khField != null) {
@@ -1062,14 +1367,27 @@ public class ForgeInjector extends Thread implements Supplier<Object>, Invocatio
                 // Forge versions without ForgeLayeredDraw
             }
 
-            for (Class<?> cls : allClasses) {
-                for (Method m : cls.getDeclaredMethods()) {
-                    Class<?>[] params = m.getParameterTypes();
-                    if (params.length == 1 && params[0] == eventCls && Modifier.isStatic(m.getModifiers())) {
-                        forceAccessible(m);
-                        log(writer, "Invoking overlay handler " + cls.getName() + "." + m.getName()
-                                + "(AddGuiOverlayLayersEvent)");
-                        m.invoke(null, addEvent);
+            int overlayInvoked = dispatchCapturedModBusListeners(writer, eventCls, addEvent);
+            if (this.hasModBusSubscribers && this.realModEventBus != null) {
+                try {
+                    Method postMethod = this.realModEventBus.getClass().getMethod("post",
+                            Class.forName("net.minecraftforge.eventbus.api.Event", false, cl));
+                    forceAccessible(postMethod);
+                    postMethod.invoke(this.realModEventBus, addEvent);
+                    overlayInvoked++;
+                } catch (Throwable ignored) {
+                }
+            }
+            if (overlayInvoked == 0) {
+                for (Class<?> cls : allClasses) {
+                    for (Method m : cls.getDeclaredMethods()) {
+                        Class<?>[] params = m.getParameterTypes();
+                        if (params.length == 1 && params[0] == eventCls && Modifier.isStatic(m.getModifiers())) {
+                            forceAccessible(m);
+                            log(writer, "Invoking overlay handler " + cls.getName() + "." + m.getName()
+                                    + "(AddGuiOverlayLayersEvent)");
+                            m.invoke(null, addEvent);
+                        }
                     }
                 }
             }
@@ -1167,14 +1485,18 @@ public class ForgeInjector extends Thread implements Supplier<Object>, Invocatio
                                             liveList.remove(i);
                                         }
                                     }
-                                    Object tickProxyLayer = Proxy.newProxyInstance(cl, new Class<?>[] { layerCls }, this);
-                                    liveList.add(tickProxyLayer);
+                                    if (this.mmGetModulesMethod != null) {
+                                        Object tickProxyLayer = Proxy.newProxyInstance(cl, new Class<?>[] { layerCls }, this);
+                                        liveList.add(tickProxyLayer);
+                                    }
                                     for (Object layer : capturedLayers) {
                                         liveList.add(layer);
                                     }
-                                    log(writer, "Injected " + capturedLayers.size()
-                                            + " HUD overlay layer(s) + tick/gamma dispatcher into live Gui.layers (total layers: "
-                                            + liveList.size() + ")!");
+                                    if (!capturedLayers.isEmpty() || this.mmGetModulesMethod != null) {
+                                        log(writer, "Injected " + capturedLayers.size()
+                                                + " HUD overlay layer(s) into live Gui.layers (total layers: "
+                                                + liveList.size() + ")!");
+                                    }
                                 }
                             }
                         }
@@ -1194,11 +1516,17 @@ public class ForgeInjector extends Thread implements Supplier<Object>, Invocatio
         ClassLoader cl = this.targetClassLoader;
         try {
             Thread.currentThread().setContextClassLoader(cl);
-            Object modEventBus = setupModernModLoadingContext(writer, cl);
 
             Method defineClassMethod = ClassLoader.class.getDeclaredMethod(
                     "defineClass", String.class, byte[].class, Integer.TYPE, Integer.TYPE, ProtectionDomain.class);
             forceAccessible(defineClassMethod);
+
+            Method findLoadedClassMethod = null;
+            try {
+                findLoadedClassMethod = ClassLoader.class.getDeclaredMethod("findLoadedClass", String.class);
+                forceAccessible(findLoadedClassMethod);
+            } catch (Throwable ignored) {
+            }
 
             Object classTransformer = null;
             Method transformMethod = null;
@@ -1239,8 +1567,8 @@ public class ForgeInjector extends Thread implements Supplier<Object>, Invocatio
             }
 
             for (String internalName : pendingBytes.keySet()) {
-                defineClassRecursive(writer, cl, defineClassMethod, classTransformer, transformMethod, pd, internalName,
-                        pendingBytes, parsedHeaders, definedClasses, visiting);
+                defineClassRecursive(writer, cl, findLoadedClassMethod, defineClassMethod, classTransformer,
+                        transformMethod, pd, internalName, pendingBytes, parsedHeaders, definedClasses, visiting);
             }
 
             List<Class<?>> allDefinedClasses = new ArrayList<Class<?>>(definedClasses.values());
@@ -1250,6 +1578,11 @@ public class ForgeInjector extends Thread implements Supplier<Object>, Invocatio
             ensureEventBusFactoryWorks(writer, cl, allDefinedClasses);
 
             Class<?> modAnnotation = tryGetClass(cl, "net.minecraftforge.fml.common.Mod", "cpw.mods.fml.common.Mod");
+            Method modValueMethod = null;
+            try {
+                modValueMethod = modAnnotation.getMethod("value");
+            } catch (NoSuchMethodException ignored) {
+            }
             Class<?> forgeEventHandlerAnnotation = null;
             Class<?> fmlInitializationEventClass = null;
             Class<?> fmlPreInitializationEventClass = null;
@@ -1266,10 +1599,24 @@ public class ForgeInjector extends Thread implements Supplier<Object>, Invocatio
                 log(writer, "Legacy @Mod.EventHandler not present (modern FML detected)");
             }
 
+            String detectedModId = "injectedmod";
             ArrayList<Object[]> mods = new ArrayList<Object[]>();
             for (Class<?> tClass : allDefinedClasses) {
-                if (tClass == null || tClass.getAnnotation((Class) modAnnotation) == null) {
+                if (tClass == null) {
                     continue;
+                }
+                Object modAnnoObj = tClass.getAnnotation((Class) modAnnotation);
+                if (modAnnoObj == null) {
+                    continue;
+                }
+                if (modValueMethod != null) {
+                    try {
+                        Object val = modValueMethod.invoke(modAnnoObj);
+                        if (val instanceof String && ((String) val).length() > 0) {
+                            detectedModId = (String) val;
+                        }
+                    } catch (Throwable ignored) {
+                    }
                 }
                 Object[] mod = new Object[3];
                 mod[0] = tClass;
@@ -1294,6 +1641,8 @@ public class ForgeInjector extends Thread implements Supplier<Object>, Invocatio
                 mod[2] = fmlInitMethods;
                 mods.add(mod);
             }
+
+            Object modEventBus = setupModernModLoadingContext(writer, cl, detectedModId);
 
             cleanupAndPrepareModState(writer, cl, allDefinedClasses);
 
@@ -1320,6 +1669,8 @@ public class ForgeInjector extends Thread implements Supplier<Object>, Invocatio
                     "net.minecraftforge.fml.event.lifecycle.FMLCommonSetupEvent");
             fireLifecycleEvent(writer, cl, allDefinedClasses,
                     "net.minecraftforge.fml.event.lifecycle.FMLClientSetupEvent");
+            fireLifecycleEvent(writer, cl, allDefinedClasses,
+                    "net.minecraftforge.fml.event.lifecycle.FMLLoadCompleteEvent");
             injectGuiOverlays(writer, cl, allDefinedClasses);
 
             log(writer, "Successfully injected!");
